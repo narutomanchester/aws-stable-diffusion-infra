@@ -132,7 +132,7 @@ resource "aws_launch_template" "lt" {
   update_default_version = true
   user_data              = filebase64("startup_script.sh")
   security_group_names   = [aws_security_group.allow_.name]
-  key_name              = {var.aws_ec2_key_name}
+  key_name              = var.aws_ec2_key_name
 
   iam_instance_profile {
     arn = aws_iam_instance_profile.ip.arn

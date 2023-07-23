@@ -2,4 +2,4 @@ runners:
   timeout: 900
 api_server:
   traffic:
-    timeout: 400
+    timeout: 900

@@ -73,8 +73,8 @@ class StableDiffusionRunnable(bentoml.Runnable):
         for image in images:
             image_refiner = self.txt2img_refiner(prompt=prompt, image=image[None, :], guidance_scale=guidance_scale, num_inference_steps=num_inference_steps, strength=0.9).images[0]
             images_output.append(image_refiner)
+            
 
-        images_output += images
         return images_output, prompt
 
     @bentoml.Runnable.method(batchable=False, batch_dim=0)

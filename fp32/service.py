@@ -93,7 +93,6 @@ class StableDiffusionRunnable(bentoml.Runnable):
         gc.collect()
         torch.cuda.empty_cache()
         
-        
         init_image = load_image(image_url).convert("RGB")
         
         images = self.img2img_pipe(

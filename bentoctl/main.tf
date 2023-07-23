@@ -141,7 +141,7 @@ resource "aws_launch_template" "lt" {
     device_name = "/dev/sda1"
 
     ebs {
-      volume_size = 600
+      volume_size = var.aws_ec2_volume_size
     }
   }
 }

@@ -5,6 +5,7 @@ include:
   - "configuration.yaml"
   - "instance.py"
   - "bentoml_numpy.py"
+  - "prometheus.yml"
 python:
   packages:
     - torch

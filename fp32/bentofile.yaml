@@ -19,16 +19,19 @@ python:
     - invisible_watermark
     - opencv-python
     - boto3
+    - aiohttp
+    - psutil
+    - asyncio
 docker:
-    distro: debian
-    cuda_version: "11.6.2"
-    env:
-      BENTOML_CONFIG: "src/configuration.yaml"
-    system_packages:
-      - libblas-dev
-      - liblapack-dev
-      - gfortran
-      - libgl1-mesa-glx
-      - ffmpeg
-      - libsm6 
-      - libxext6
+  distro: debian
+  cuda_version: "11.6.2"
+  env:
+    BENTOML_CONFIG: "src/configuration.yaml"
+  system_packages:
+    - libblas-dev
+    - liblapack-dev
+    - gfortran
+    - libgl1-mesa-glx
+    - ffmpeg
+    - libsm6 
+    - libxext6

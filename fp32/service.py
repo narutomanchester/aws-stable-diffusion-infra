@@ -22,6 +22,11 @@ from diffusers.utils import pt_to_pil
 import gc
 from diffusers.utils import load_image
 import logging
+from PIL import Image, ImageFilter
+from multiprocessing import Process
+import threading
+import asyncio
+
 
 # torch.autocast(device_type="cpu", enabled=False)
 
@@ -35,6 +40,8 @@ class StableDiffusionRunnable(bentoml.Runnable):
         self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-0.9", torch_dtype=torch.float16, use_safetensors=True, variant="fp16").to("cuda")
 
         self.txt2img_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-0.9", torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
+        # .to("cuda")
+
         self.txt2img_refiner.enable_model_cpu_offload()
         self.img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-0.9", torch_dtype=torch.float16)
         self.img2img_pipe.enable_model_cpu_offload()
@@ -49,13 +56,20 @@ class StableDiffusionRunnable(bentoml.Runnable):
         width = data.get('width', 1024)
         no_images = data.get('no_images', 2)
         num_inference_steps = data.get('num_inference_steps', 70)
+        r_guidance_scale = data.get('r_guidance_scale', 7.5)
+        r_num_inference_steps = data.get('r_num_inference_steps', 70)
+        r_strength = data.get('r_strength', 0.1)
         generator = torch.Generator('cuda')
         generator.manual_seed(data.get('seed'))
-
+        use_r = data.get('use_r', True)
         gc.collect()
         torch.cuda.empty_cache()
 
+        images = []
         images_output = []
+
+        
+        # for i in range(no_images):
         images = self.txt2img_pipe(
                 prompt=prompt,
                 guidance_scale=guidance_scale,
@@ -64,18 +78,23 @@ class StableDiffusionRunnable(bentoml.Runnable):
                 num_inference_steps=num_inference_steps,
                 generator=generator,
                 num_images_per_prompt=no_images,
-                output_type="latent"
+                output_type="latent" if use_r else "pil"
             ).images
+            # images.append(image)
         
-        logging.error(f"images: {type(images)}")
+        logging.info(f"images: {type(images)}")
         # logging.error(f"txt2img_refiner: {type(self.txt2img_refiner)}")
-        
-        for image in images:
-            image_refiner = self.txt2img_refiner(prompt=prompt, image=image[None, :], guidance_scale=guidance_scale, num_inference_steps=num_inference_steps, strength=0.9).images[0]
-            images_output.append(image_refiner)
-            
+        gc.collect()
+        torch.cuda.empty_cache()
 
-        return images_output, prompt
+        if use_r:
+            for image in images:
+                image_refiner = self.txt2img_refiner(prompt=prompt, image=image[None, :], guidance_scale=r_guidance_scale, num_inference_steps=r_num_inference_steps, strength=r_strength).images[0]
+                images_output.append(image_refiner)
+            
+            return images_output, prompt
+        
+        return images, prompt
 
     @bentoml.Runnable.method(batchable=False, batch_dim=0)
     def img2img(self, data):
@@ -88,13 +107,17 @@ class StableDiffusionRunnable(bentoml.Runnable):
         generator = torch.Generator('cuda')
         generator.manual_seed(data.get('seed'))
         no_images = data.get('no_images', 2)
+        image_strength = data.get('image_strength', 6)
         image_url = data.get('image_url', '')
+        
 
         gc.collect()
         torch.cuda.empty_cache()
         
-        init_image = load_image(image_url).convert("RGB")
+        init_image = load_image(image_url).convert("RGB").filter(ImageFilter.GaussianBlur(image_strength))
         
+        images = []
+        # for i in range(no_images):
         images = self.img2img_pipe(
             prompt=prompt,
             image=init_image,
@@ -103,12 +126,15 @@ class StableDiffusionRunnable(bentoml.Runnable):
             num_inference_steps=num_inference_steps,
             generator=generator,
             num_images_per_prompt=no_images
+
         ).images
+
+            # images.append(image)
         
         return images, prompt
 
 
-stable_diffusion_runner = bentoml.Runner(StableDiffusionRunnable, name='stable_diffusion_runner', max_batch_size=10)
+stable_diffusion_runner = bentoml.Runner(StableDiffusionRunnable, name='stable_diffusion_runner', max_batch_size=2)
 
 svc = bentoml.Service("stable_diffusion_fp32", runners=[stable_diffusion_runner])
 svc.add_asgi_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["*"])
@@ -144,7 +170,7 @@ def upload_images(prompt, images):
     return url
 
 class Txt2ImgInput(BaseModel):
-    id: int
+    id: str
     prompt: str
     guidance_scale: float = 7.5
     height: int = 512
@@ -153,27 +179,54 @@ class Txt2ImgInput(BaseModel):
     safety_check: bool = True
     seed: int = None
     no_images: int = 2
+    r_num_inference_steps: int =70
+    r_guidance_scale: float = 7.5
+    r_strength: float = 0.05
+    use_r: bool = True
 
-class Output(BaseModel):
-    id: int
-    images: list
 
 @svc.api(input=JSON(pydantic_model=Txt2ImgInput), output=JSON())
 def txt2img(data, context):
     data = data.dict()
-    data['seed'] = generate_seed_if_needed(data['seed'])
-    images, prompt = stable_diffusion_runner.txt2img.run(data)
-    url = upload_images(prompt,images)
+    
+    async def handling( stable_diffusion_runner, data):
         
+        data['seed'] = generate_seed_if_needed(data['seed'])
+        images, prompt = await stable_diffusion_runner.txt2img.async_run(data)
+        url = upload_images(prompt,images)
+        
+    def loop_in_thread(loop, stable_diffusion_runner, data):
+        asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(handling(stable_diffusion_runner, data))
+
+    def create_threads(stable_diffusion_runner, data):
+
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError as e:
+            if str(e).startswith('There is no current event loop in thread'):
+                loop = asyncio.new_event_loop()
+                # asyncio.set_event_loop(loop)
+            else:
+                raise
+
+        t = threading.Thread(target=loop_in_thread, args=(loop, stable_diffusion_runner, data, ))
+        t.start()
+
+    create_threads(stable_diffusion_runner, data)
+
     for i in data:
         context.response.headers.append(i, str(data[i]))
         
-    return {'image': url}
+    return {'status': 'OK'}
 
 class Img2ImgInput(BaseModel):
-    id: int
+    id: str
     prompt: str
     strength: float = 0.8
+    image_strength: int = 5
     guidance_scale: float = 7.5
     num_inference_steps: int = 50
     safety_check: bool = True
@@ -185,11 +238,36 @@ class Img2ImgInput(BaseModel):
 @svc.api(input=JSON(pydantic_model=Img2ImgInput), output=JSON())
 def img2img(data, context):
     data = data.dict()
-    data['seed'] = generate_seed_if_needed(data['seed'])
-    images, prompt = stable_diffusion_runner.img2img.run(data)
-    url = upload_images(prompt,images)
+
+    async def handling( stable_diffusion_runner, data):
+        
+        data['seed'] = generate_seed_if_needed(data['seed'])
+        images, prompt = await stable_diffusion_runner.img2img.async_run(data)
+        url = upload_images(prompt,images)
+        
+    def loop_in_thread(loop, stable_diffusion_runner, data):
+        asyncio.set_event_loop(loop)
+        
+        loop.run_until_complete(handling(stable_diffusion_runner, data))
+
+    def create_threads(stable_diffusion_runner, data):
+
+        try:
+            loop = asyncio.get_event_loop()
+        except RuntimeError as e:
+            if str(e).startswith('There is no current event loop in thread'):
+                loop = asyncio.new_event_loop()
+                # asyncio.set_event_loop(loop)
+            else:
+                raise
+
+        t = threading.Thread(target=loop_in_thread, args=(loop, stable_diffusion_runner, data, ))
+        t.start()
+
+    create_threads(stable_diffusion_runner, data)
         
     for i in data:
         context.response.headers.append(i, str(data[i]))
-    return  {'image': url}
+    
+    return  {'status': 'OK'}
 

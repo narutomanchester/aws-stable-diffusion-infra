@@ -132,7 +132,7 @@ resource "aws_launch_template" "lt" {
   update_default_version = true
   user_data              = filebase64("startup_script.sh")
   security_group_names   = [aws_security_group.allow_.name]
-  key_name              = var.aws_ec2_key_name
+  key_name              = "hiephh"
 
   iam_instance_profile {
     arn = aws_iam_instance_profile.ip.arn
@@ -141,7 +141,7 @@ resource "aws_launch_template" "lt" {
     device_name = "/dev/sda1"
 
     ebs {
-      volume_size = var.aws_ec2_volume_size
+      volume_size = 600
     }
   }
 }

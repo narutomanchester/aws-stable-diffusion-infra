@@ -26,9 +26,10 @@ from PIL import Image, ImageFilter
 from multiprocessing import Process
 import threading
 import asyncio
-
+import time
 
 # torch.autocast(device_type="cpu", enabled=False)
+
 
 class StableDiffusionRunnable(bentoml.Runnable):
     SUPPORTED_RESOURCES = ("nvidia.com/gpu", "cpu")
@@ -134,7 +135,30 @@ class StableDiffusionRunnable(bentoml.Runnable):
         return images, prompt
 
 
-stable_diffusion_runner = bentoml.Runner(StableDiffusionRunnable, name='stable_diffusion_runner', max_batch_size=2)
+# Define Prometheus Metrics
+# txt2img_model_run_counter = bentoml.metrics.Counter(
+#     name="txt2img_model_run_total",
+#     documentation="txt2img_model_run_total",
+#     labelnames=["txt2img_model_run_total"],
+# )
+# img2img_model_run_counter = bentoml.metrics.Counter(
+#     name="img2img_model_run_total",
+#     documentation="img2img_model_run_total",
+#     labelnames=["img2img_model_run_total"],
+# )
+
+# txt2img_model_run_failed = bentoml.metrics.Counter(
+#     name="txt2img_model_run_failed",
+#     documentation="txt2img_model_run_failed",
+#     labelnames=["txt2img_model_run_failed"],
+# )
+# img2img_model_run_failed = bentoml.metrics.Counter(
+#     name="img2img_model_run_failed",
+#     documentation="img2img_model_run_failed",
+#     labelnames=["img2img_model_run_failed"],
+# )
+
+stable_diffusion_runner = bentoml.Runner(StableDiffusionRunnable, name='stable_diffusion_runner')
 
 svc = bentoml.Service("stable_diffusion_fp32", runners=[stable_diffusion_runner])
 svc.add_asgi_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["*"])
@@ -190,19 +214,30 @@ def txt2img(data, context):
     data = data.dict()
     
     async def handling( stable_diffusion_runner, data):
-        
+
         data['seed'] = generate_seed_if_needed(data['seed'])
         images, prompt = await stable_diffusion_runner.txt2img.async_run(data)
         url = upload_images(prompt,images)
         
+            
+        
     def loop_in_thread(loop, stable_diffusion_runner, data):
+        
         asyncio.set_event_loop(loop)
         
         loop.run_until_complete(handling(stable_diffusion_runner, data))
+                # break
+            # except Exception as e:
+            #     txt2img_model_run_failed.labels(txt2img_model_run_failed=is_positive).inc()
+
+            #     logging.error(f"Need to rerun. Run error at handling async with id {data['id']}: {e}")
+                
+            #     time.sleep(30)
 
     def create_threads(stable_diffusion_runner, data):
 
-
+         # update metrics
+        # txt2img_model_run_counter.labels(txt2img_model_run_total=is_positive).inc()
         try:
             loop = asyncio.get_event_loop()
         except RuntimeError as e:
@@ -212,8 +247,11 @@ def txt2img(data, context):
             else:
                 raise
 
+       
         t = threading.Thread(target=loop_in_thread, args=(loop, stable_diffusion_runner, data, ))
         t.start()
+        
+            
 
     create_threads(stable_diffusion_runner, data)
 
@@ -240,10 +278,20 @@ def img2img(data, context):
     data = data.dict()
 
     async def handling( stable_diffusion_runner, data):
+        while True:
+            try:
+                # add metrics
+                # img2img_model_run_counter.labels(img2img_model_run_total=is_positive).inc()
+
+                data['seed'] = generate_seed_if_needed(data['seed'])
+                images, prompt = await stable_diffusion_runner.img2img.async_run(data)
+                url = upload_images(prompt,images)
+                break
+            except Exception as e:
+                # img2img_model_run_failed.labels(img2img_model_run_failed=is_positive).inc()
+                logging.error(f"Need to rerun. Run error at handling async with id {data['id']}: {e}")
+                time.sleep(30)
         
-        data['seed'] = generate_seed_if_needed(data['seed'])
-        images, prompt = await stable_diffusion_runner.img2img.async_run(data)
-        url = upload_images(prompt,images)
         
     def loop_in_thread(loop, stable_diffusion_runner, data):
         asyncio.set_event_loop(loop)

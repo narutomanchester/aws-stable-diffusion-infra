@@ -5,7 +5,7 @@ operator:
 template: terraform
 spec:
   region: ap-southeast-1
-  instance_type: g4dn.12xlarge
+  instance_type: g4dn.4xlarge
   # Deep Learning AMI GPU PyTorch 1.13.1 (Ubuntu 20.04) 20230530
   ami_id: ami-07038c7683047a90a
   enable_gpus: true

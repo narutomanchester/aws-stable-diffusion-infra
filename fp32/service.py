@@ -27,7 +27,10 @@ from multiprocessing import Process
 import threading
 import asyncio
 import time
-
+from requests import Request, Session
+from requests.exceptions import ConnectionError, Timeout, TooManyRedirects
+import requests
+import json
 # torch.autocast(device_type="cpu", enabled=False)
 
 
@@ -38,13 +41,13 @@ class StableDiffusionRunnable(bentoml.Runnable):
     def __init__(self):
 
         ##### model stable-diffusion-xl-base-0.9
-        self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-0.9", torch_dtype=torch.float16, use_safetensors=True, variant="fp16").to("cuda")
+        self.txt2img_pipe = StableDiffusionXLPipeline.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", torch_dtype=torch.float16, use_safetensors=True, variant="fp16").to("cuda")
 
-        self.txt2img_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-0.9", torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
+        self.txt2img_refiner = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", torch_dtype=torch.float16, use_safetensors=True, variant="fp16")
         # .to("cuda")
 
         self.txt2img_refiner.enable_model_cpu_offload()
-        self.img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-0.9", torch_dtype=torch.float16)
+        self.img2img_pipe = StableDiffusionXLImg2ImgPipeline.from_pretrained("stabilityai/stable-diffusion-xl-refiner-1.0", torch_dtype=torch.float16)
         self.img2img_pipe.enable_model_cpu_offload()
 
     @bentoml.Runnable.method(batchable=False, batch_dim=0)
@@ -135,34 +138,44 @@ class StableDiffusionRunnable(bentoml.Runnable):
         return images, prompt
 
 
-# Define Prometheus Metrics
-# txt2img_model_run_counter = bentoml.metrics.Counter(
-#     name="txt2img_model_run_total",
-#     documentation="txt2img_model_run_total",
-#     labelnames=["txt2img_model_run_total"],
-# )
-# img2img_model_run_counter = bentoml.metrics.Counter(
-#     name="img2img_model_run_total",
-#     documentation="img2img_model_run_total",
-#     labelnames=["img2img_model_run_total"],
-# )
-
-# txt2img_model_run_failed = bentoml.metrics.Counter(
-#     name="txt2img_model_run_failed",
-#     documentation="txt2img_model_run_failed",
-#     labelnames=["txt2img_model_run_failed"],
-# )
-# img2img_model_run_failed = bentoml.metrics.Counter(
-#     name="img2img_model_run_failed",
-#     documentation="img2img_model_run_failed",
-#     labelnames=["img2img_model_run_failed"],
-# )
-
 stable_diffusion_runner = bentoml.Runner(StableDiffusionRunnable, name='stable_diffusion_runner')
 
 svc = bentoml.Service("stable_diffusion_fp32", runners=[stable_diffusion_runner])
 svc.add_asgi_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"], expose_headers=["*"])
 
+def call_webhook(data, url, is_error=False):
+    headers = {
+                'api-key': Instance.WEBHOOK_API_KEY,
+                'content-type': 'application/json'
+            }
+
+
+    try:
+        if is_error:
+            response = requests.post(Instance.WEBHOOK_API_URL, 
+                                json={
+                                        "id": data["id"],
+                                        "link": [],
+                                        "error": "0",
+                                        "seed": data["seed"]
+                                    },
+                                headers=headers
+                            )
+            logging.error(f"Resp at Webhook Error requests with id {data['id']}: {response.text}")
+        else:
+            response = requests.post(Instance.WEBHOOK_API_URL, 
+                                json={
+                                        "id": data["id"],
+                                        "link": url,
+                                        "seed": data["seed"]
+                                    },
+                                headers=headers
+                            )
+            logging.error(f"Resp at Success Webhook with id {data['id']}: {response.text}")
+        
+
+    except Exception as e:
+        logging.error(f"Exception at Webhook : {e}")
 
 def generate_seed_if_needed(seed):
     if seed is None:
@@ -170,7 +183,7 @@ def generate_seed_if_needed(seed):
         seed = torch.seed()
     return seed
 
-def upload_images(prompt, images):
+def upload_images(request_id, prompt, images):
     url = []
     
 
@@ -181,16 +194,19 @@ def upload_images(prompt, images):
     s3_client = boto3.client('s3',
                             aws_access_key_id=Instance.AWS_ACCESS_KEY_ID,
                             aws_secret_access_key=Instance.AWS_SECRET_ACCESS_KEY)
-    try:
-        for image in images:
-            file_name = f"{sha256(prompt.encode('utf-8')).hexdigest()}_{int(time.time()*1000000)}.jpeg"
+    
+    prompt_encode = sha256(prompt.encode('utf-8')).hexdigest()
+    for i, image in enumerate(images):
+        try:
+            prompt_save_encode = ''.join([x for id_, x in enumerate(prompt_encode) if id_ %(i+2) == 0])
+            file_name = f"{request_id}{prompt_save_encode}{int(time.time()*1000000)}.jpeg"
             image.save(file_name)
 
             response = s3_client.upload_file(file_name, bucket_name, file_name)
             url.append(f"{Instance.S3_BUCKET_BASED_END_POINT}/{bucket_name}/{file_name}")
-    except Exception as e:
-        logging.error(e)
-        return []
+        except Exception as e:
+            logging.error(f"Exception at upload image with id {request_id}: {e}")
+            
     return url
 
 class Txt2ImgInput(BaseModel):
@@ -214,11 +230,18 @@ def txt2img(data, context):
     data = data.dict()
     
     async def handling( stable_diffusion_runner, data):
-
-        data['seed'] = generate_seed_if_needed(data['seed'])
-        images, prompt = await stable_diffusion_runner.txt2img.async_run(data)
-        url = upload_images(prompt,images)
+        try:
+            data['seed'] = generate_seed_if_needed(data['seed'])
+            images, prompt = await stable_diffusion_runner.txt2img.async_run(data)
+            url = upload_images(data['id'], prompt,images)
+            call_webhook(data, url)
         
+        except Exception as e:
+            # img2img_model_run_failed.labels(img2img_model_run_failed=is_positive).inc()
+            logging.error(f"Run fail in run model with id {data['id']}: {e}")
+            call_webhook(data, [], is_error=True)
+            return
+            
             
         
     def loop_in_thread(loop, stable_diffusion_runner, data):
@@ -226,13 +249,9 @@ def txt2img(data, context):
         asyncio.set_event_loop(loop)
         
         loop.run_until_complete(handling(stable_diffusion_runner, data))
-                # break
-            # except Exception as e:
-            #     txt2img_model_run_failed.labels(txt2img_model_run_failed=is_positive).inc()
 
-            #     logging.error(f"Need to rerun. Run error at handling async with id {data['id']}: {e}")
+        loop.close()
                 
-            #     time.sleep(30)
 
     def create_threads(stable_diffusion_runner, data):
 
@@ -245,7 +264,9 @@ def txt2img(data, context):
                 loop = asyncio.new_event_loop()
                 # asyncio.set_event_loop(loop)
             else:
-                raise
+                logging.error(f"Run fail with id {data['id']}: {e}")
+                call_webhook(data, [], is_error=True)
+                return
 
        
         t = threading.Thread(target=loop_in_thread, args=(loop, stable_diffusion_runner, data, ))
@@ -278,19 +299,20 @@ def img2img(data, context):
     data = data.dict()
 
     async def handling( stable_diffusion_runner, data):
-        while True:
-            try:
-                # add metrics
-                # img2img_model_run_counter.labels(img2img_model_run_total=is_positive).inc()
+        
+        try:
+            # add metrics
+            # img2img_model_run_counter.labels(img2img_model_run_total=is_positive).inc()
 
-                data['seed'] = generate_seed_if_needed(data['seed'])
-                images, prompt = await stable_diffusion_runner.img2img.async_run(data)
-                url = upload_images(prompt,images)
-                break
-            except Exception as e:
-                # img2img_model_run_failed.labels(img2img_model_run_failed=is_positive).inc()
-                logging.error(f"Need to rerun. Run error at handling async with id {data['id']}: {e}")
-                time.sleep(30)
+            data['seed'] = generate_seed_if_needed(data['seed'])
+            images, prompt = await stable_diffusion_runner.img2img.async_run(data)
+            url = upload_images(data['id'], prompt,images)
+            call_webhook(data, url)
+        except Exception as e:
+            # img2img_model_run_failed.labels(img2img_model_run_failed=is_positive).inc()
+            logging.error(f"Run fail in run model with id {data['id']}: {e}")
+            call_webhook(data, [], is_error=True)
+            return
         
         
     def loop_in_thread(loop, stable_diffusion_runner, data):
@@ -307,7 +329,9 @@ def img2img(data, context):
                 loop = asyncio.new_event_loop()
                 # asyncio.set_event_loop(loop)
             else:
-                raise
+                logging.error(f"Run fail with id {data['id']}: {e}")
+                call_webhook(data, [], is_error=True)
+                return
 
         t = threading.Thread(target=loop_in_thread, args=(loop, stable_diffusion_runner, data, ))
         t.start()
